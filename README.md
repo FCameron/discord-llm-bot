@@ -232,7 +232,7 @@ The table shows **100** rows at a time, sorted by the column you last pressed `t
 | **↑ / ↓**          | Move the row selector; while overlaying scrolls the message text                                                           |
 | **Space**          | Toggle _overlay mode_: show the full `content` of the selected row on the whole screen. Press any key to exit overlay.     |
 | **Enter**          | Exit the viewer (the UI also exits on **q** or **Ctrl‑C**).                                                                |
-| **x**              | Delete the selected row after a yes/no confirmation dialog. Does nothing while overlaying.                                 |
+| **x**              | Delete the selected row. Does nothing while overlaying.                                                                    |
 | **t**              | Sort by the currently selected column. First press sorts descending; pressing the same column again toggles the direction. |
 | **q** / **Ctrl‑C** | Quit the viewer.                                                                                                           |
 
