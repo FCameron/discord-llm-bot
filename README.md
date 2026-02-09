@@ -22,6 +22,11 @@ The bot also logs every exchange to an SQLite database and prints the model’s 
   - [Creating a Discord Bot](#creating-a-discord-bot)
   - [Setting Environment Variables](#setting-environment-variables)
 - [Running the Bot](#running-the-bot)
+- [Chat History Viewer](#chat-history-viewer)
+  - [How to launch](#how-to-launch)
+  - [What you see](#what-you-see)
+  - [Key bindings](#key-bindings)
+  - [Behind the scenes](#behind-the-scenes)
 - [Testing](#testing)
 - [License](#license)
 
@@ -29,11 +34,11 @@ The bot also logs every exchange to an SQLite database and prints the model’s 
 
 ## Prerequisites
 
-| Component | Minimum Version |
-|-----------|-----------------|
-| Python    | 3.11+           |
-| Ollama    | 0.1.26+ (latest)|
-| Discord API token | *created via Discord Developer Portal* |
+| Component         | Minimum Version                        |
+| ----------------- | -------------------------------------- |
+| Python            | 3.11+                                  |
+| Ollama            | 0.1.26+ (latest)                       |
+| Discord API token | _created via Discord Developer Portal_ |
 
 > **Tip:** If you don’t already have a virtual‑env tool, install `venv` via `python -m pip install virtualenv`.
 
@@ -57,8 +62,8 @@ source .venv/bin/activate
 The bot relies on the following Python packages:
 
 - `discord.py` – The official Discord library
-- `aiohttp`   – Async HTTP client used by the bot to talk to Ollama
-- `pytest`    – For the test suite
+- `aiohttp` – Async HTTP client used by the bot to talk to Ollama
+- `pytest` – For the test suite
 - `pytest-asyncio` – Async test support
 - `pytest-mock` – Easier mocking in tests
 
@@ -140,11 +145,11 @@ export OLLAMA_NUM_CTX=8192
 
 ### Creating a Discord Bot
 
-1. Go to the [Discord Developer Portal](https://discord.com/developers/applications).  
-2. Create a **New Application**.  
-3. In the **Bot** tab, click **Add Bot** → **Yes, do it!**  
-4. Under **Token**, click **Copy**. This is your `DISCORD_TOKEN`.  
-5. Under **Privileged Gateway Intents**, enable **MESSAGE CONTENT INTENT**.  
+1. Go to the [Discord Developer Portal](https://discord.com/developers/applications).
+2. Create a **New Application**.
+3. In the **Bot** tab, click **Add Bot** → **Yes, do it!**
+4. Under **Token**, click **Copy**. This is your `DISCORD_TOKEN`.
+5. Under **Privileged Gateway Intents**, enable **MESSAGE CONTENT INTENT**.
 6. In **OAuth2 → URL Generator**, select the **bot** scope and the following permissions:
    - Send Messages
    - Read Message History
@@ -181,6 +186,64 @@ You should see output like:
 ```
 
 The bot will now reply to any `@<bot>` mention in any channel it has access to, and will also handle direct messages.
+
+---
+
+## Chat History Viewer
+
+`ChatHistoryUI.py` ships with the bot as an interactive, full‑screen viewer for the SQLite database that stores every message.  
+It’s handy for debugging, inspecting what the bot has seen, and for manual cleanup of the history.
+
+> **Why it matters**  
+> The database is the single source of truth for all user, assistant and “thinking” messages.  
+> The viewer lets you explore that data without leaving the terminal.
+
+### How to launch
+
+```bash
+# If the database is in the default location (chat_history.db in your current dir)
+python ChatHistoryUI.py
+
+# Or point to a different DB:
+export CHAT_HISTORY_DB=/path/to/your/chat_history.db
+python ChatHistoryUI.py
+```
+
+The UI starts in full‑screen mode (press **Esc** or **Ctrl‑C** to return to the shell).
+
+### What you see
+
+| Column        | Description                                  |
+| ------------- | -------------------------------------------- |
+| **user_name** | The Discord username that sent the message   |
+| **is_dm**     | `1` if the message was a DM, `0` otherwise   |
+| **role**      | One of: `user`, `assistant`, `thinking`      |
+| **timestamp** | UTC timestamp of when the message was logged |
+
+The table shows **100** rows at a time, sorted by the column you last pressed `t` on.
+
+### Key bindings
+
+| Key                | Action                                                                                                                     |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| **← / →**          | Move the column selector (ignored while overlaying)                                                                        |
+| **↑ / ↓**          | Move the row selector; while overlaying scrolls the message text                                                           |
+| **Space**          | Toggle _overlay mode_: show the full `content` of the selected row on the whole screen. Press any key to exit overlay.     |
+| **Enter**          | Exit the viewer (the UI also exits on **q** or **Ctrl‑C**).                                                                |
+| **x**              | Delete the selected row after a yes/no confirmation dialog. Does nothing while overlaying.                                 |
+| **t**              | Sort by the currently selected column. First press sorts descending; pressing the same column again toggles the direction. |
+| **q** / **Ctrl‑C** | Quit the viewer.                                                                                                           |
+
+> _Overlay scrolling_ – While overlaying, the up/down arrow keys move the visible portion of the message text instead of the table selection.
+
+### Behind the scenes
+
+- The viewer connects directly to the same SQLite database that `LlamaGPT.py` writes to.
+- Deleting a row removes the record from the database and from the UI’s in‑memory list.
+- Sorting re‑fetches the data with the appropriate `ORDER BY` clause.
+- The UI refreshes automatically every second so that new messages show up instantly.
+
+Feel free to use this tool to sanity‑check your logs, delete stray messages, or just satisfy your curiosity about what the bot has stored.
 
 ---
 

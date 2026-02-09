@@ -3,7 +3,7 @@
 Discord bot that forwards @mentions to a local Ollama model.
 Now also prints what the model is “thinking” (the internal planning text)
 before it produces the final answer, can reply to private whispers,
-and **writes every chat exchange to a local SQLite database** so it can
+and writes every chat exchange to a local SQLite database so it can
 be queried and survives a script reload.
 """
 
@@ -234,6 +234,19 @@ async def on_message(message: Message):
 
         print(f"[Assistant] {answer}")
 
+        # Log the “thinking” text before the assistant answer so that the
+        # assistant row is still the most‑recent entry in the DB.
+        if thinking:
+            insert_message(
+                DB_CONN,
+                user_id=message.author.id,
+                channel_id=message.channel.id,
+                is_dm=True,
+                role="thinking",
+                content=thinking,
+                user_name=str(message.author),
+            )
+
         insert_message(
             DB_CONN,
             user_id=message.author.id,
@@ -278,6 +291,19 @@ async def on_message(message: Message):
             print(f"[Thinking] {thinking}")
 
         print(f"[Assistant] {answer}")
+
+        # Log the “thinking” text before the assistant answer so that the
+        # assistant row is still the most‑recent entry in the DB.
+        if thinking:
+            insert_message(
+                DB_CONN,
+                user_id=message.author.id,
+                channel_id=message.channel.id,
+                is_dm=False,
+                role="thinking",
+                content=thinking,
+                user_name=str(message.author),
+            )
 
         insert_message(
             DB_CONN,
