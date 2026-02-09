@@ -10,6 +10,7 @@ Key changes (for this version):
 - The **t** key sorts the rows by the current columns, press again to resort.
 - Pressing **x** deletes the selected row. When overlaying a long message,
 - the arrow keys scroll the text instead of moving the table selection.
+- Overlay now wraps long lines and dynamically updates on window resize.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sqlite3
+import textwrap
 from collections import OrderedDict
 
 from prompt_toolkit import Application
@@ -25,9 +27,9 @@ from prompt_toolkit.layout import FormattedTextControl, HSplit, Layout, VSplit, 
 from prompt_toolkit.shortcuts import yes_no_dialog
 from prompt_toolkit.styles import Style
 
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------
 # Configuration – point at the same DB the bot uses
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------
 DB_PATH = os.getenv("CHAT_HISTORY_DB", os.path.expanduser("chat_history.db"))
 if not os.path.exists(DB_PATH):
     raise FileNotFoundError(f"No database at {DB_PATH} – is the bot running?")
@@ -36,9 +38,9 @@ if not os.path.exists(DB_PATH):
 _ORIG_SQLITE_CONNECT = sqlite3.connect
 
 
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------
 # Helper: run a query, return column names and rows
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------
 def fetch(
     order_by: str | None = None, descending: bool = True
 ) -> tuple[list[str], list[tuple]]:
@@ -54,9 +56,9 @@ def fetch(
         return cols, rows
 
 
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------
 # Periodic refresh: re‑fetch the DB every second
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------
 async def _periodic_refresh(ui: "TableUI") -> None:
     while True:
         await asyncio.sleep(1)
@@ -67,9 +69,9 @@ async def _periodic_refresh(ui: "TableUI") -> None:
             ui.app.invalidate()
 
 
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------
 # The UI – a very small table viewer
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------
 class TableUI:
     # indices of the four columns we want to display
     _VISIBLE_COLS = ("user_name", "is_dm", "role", "timestamp")
@@ -92,11 +94,9 @@ class TableUI:
         self.overlay_text: str | None = None
         # offset into the displayed message when overlaying
         self.overlay_offset: int = 0
+
         # compute how many lines fit in the body window
-        try:
-            self.body_height = os.get_terminal_size().lines - 1  # 1 for header
-        except OSError:
-            self.body_height = 24 - 1
+        self._refresh_dimensions()
 
         # Prompt‑toolkit widgets
         self.header_control = FormattedTextControl(text=self._render_header)
@@ -123,8 +123,28 @@ class TableUI:
             full_screen=True,
             mouse_support=False,
         )
-        # NOTE: The periodic refresh task is *not* started here.
-        # It will be scheduled in ``run()`` once the event‑loop is running.
+
+    # ----------------------------------------------------------------------
+    # Helper – refresh terminal dimensions
+    # ----------------------------------------------------------------------
+    def _refresh_dimensions(self) -> None:
+        """Refresh `body_height` and `body_width` from the current terminal."""
+        try:
+            size = os.get_terminal_size()
+            self.body_height = size.lines - 1  # 1 for header
+            self.body_width = size.columns
+        except OSError:
+            # Fallback for non‑interactive environments
+            self.body_height = 24 - 1
+            self.body_width = 80
+
+    # ----------------------------------------------------------------------
+    # Callback for terminal resize
+    # ----------------------------------------------------------------------
+    def _on_resize(self, app: Application) -> None:
+        """Called by prompt_toolkit when the window is resized."""
+        self._refresh_dimensions()
+        app.invalidate()
 
     # ----------------------------------------------------------------------
     # Rendering helpers
@@ -151,15 +171,23 @@ class TableUI:
     def _render_body(self):
         """
         Return a flat list of (style, text) tuples for the body.
-        Handles overlay mode.
+        Handles overlay mode and dynamic wrapping / resizing.
         """
+        # Ensure dimensions are up‑to‑date
+        self._refresh_dimensions()
+
         # If we are overlaying, just show the content.
         if self.overlay_text is not None:
-            lines = self.overlay_text.splitlines()
+            # Split on existing newlines, then wrap each line to the terminal width
+            raw_lines = self.overlay_text.splitlines()
+            wrapped_lines: list[str] = []
+            for raw in raw_lines:
+                wrapped_lines.extend(textwrap.wrap(raw, width=self.body_width))
+            # Apply scrolling offset
             start = self.overlay_offset
-            end = min(start + self.body_height, len(lines))
+            end = min(start + self.body_height, len(wrapped_lines))
             result: list[tuple[str, str]] = []
-            for line in lines[start:end]:
+            for line in wrapped_lines[start:end]:
                 result.append(("", line + "\n"))
             return result
 
@@ -213,8 +241,13 @@ class TableUI:
         @self.kb.add("up")
         def _up(event):
             if self.overlay_text is not None:
-                lines = self.overlay_text.splitlines()
-                max_offset = max(0, len(lines) - self.body_height)
+                # Ensure dimensions are current
+                self._refresh_dimensions()
+                raw_lines = self.overlay_text.splitlines()
+                wrapped_lines = []
+                for raw in raw_lines:
+                    wrapped_lines.extend(textwrap.wrap(raw, width=self.body_width))
+                max_offset = max(0, len(wrapped_lines) - self.body_height)
                 self.overlay_offset = max(0, self.overlay_offset - 1)
                 event.app.invalidate()
             else:
@@ -223,8 +256,13 @@ class TableUI:
         @self.kb.add("down")
         def _down(event):
             if self.overlay_text is not None:
-                lines = self.overlay_text.splitlines()
-                max_offset = max(0, len(lines) - self.body_height)
+                # Ensure dimensions are current
+                self._refresh_dimensions()
+                raw_lines = self.overlay_text.splitlines()
+                wrapped_lines = []
+                for raw in raw_lines:
+                    wrapped_lines.extend(textwrap.wrap(raw, width=self.body_width))
+                max_offset = max(0, len(wrapped_lines) - self.body_height)
                 self.overlay_offset = min(max_offset, self.overlay_offset + 1)
                 event.app.invalidate()
             else:
@@ -338,18 +376,18 @@ class TableUI:
         asyncio.run(_start())
 
 
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------
 # Main – drop into the console
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------
 if __name__ == "__main__":
     os.environ["CHAT_HISTORY_DB"] = DB_PATH
     ui = TableUI()
     ui.run()
 
 
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------
 # Make the module available as a global name for tests
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------
 import builtins
 import sys
 
