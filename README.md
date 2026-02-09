@@ -1,4 +1,4 @@
-# discord‑llm‑bot
+# LocalGPT
 
 A lightweight Discord bot that forwards user mentions to a **locally hosted LLM via Ollama**.  
 The bot also logs every exchange to an SQLite database and prints the model’s internal “thinking” text for debugging.
