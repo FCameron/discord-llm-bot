@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
-Interactive viewer for the chat history that ships with LlamaGPT.py
+ChatHistoryUI – a lightweight, terminal‑based viewer for the LlamaGPT chat history.
 
-Key changes (for this version):
+The UI shows a tabular view of the most recent messages stored in the same
+SQLite database that LlamaGPT uses.  It supports:
 
-- Only the four columns `user_name`, `is_dm`, `role`, `timestamp` are shown.
-- Pressing **Space** overlays the *content* of the currently selected row
-  on the whole screen – pressing any key while overlaying closes it.
-- The **t** key sorts the rows by the current columns, press again to resort.
-- Pressing **x** deletes the selected row. When overlaying a long message,
-- the arrow keys scroll the text instead of moving the table selection.
-- Overlay now wraps long lines and dynamically updates on window resize.
+* **Space** – toggle an overlay that shows the full content of the selected row.
+  Scrolling is performed with the arrow keys while the overlay is active.
+* **Arrow keys** – move the selection.  While overlayed the arrows scroll the
+  text instead of changing the row/column selection.
+* **t** – sort by the currently selected column; repeated presses toggle
+  ascending/descending, pressing *t* on a different column starts with
+  descending order.
+* **x** – delete the selected row.
+* **q** or **Ctrl‑C** – quit the application.
+
+Only the four columns ``user_name``, ``is_dm``, ``role`` and ``timestamp`` are
+displayed in the table – the rest of the row is shown in the overlay.
 """
 
 from __future__ import annotations
@@ -19,104 +25,131 @@ import asyncio
 import os
 import sqlite3
 import textwrap
-from collections import OrderedDict
+from collections.abc import Iterable
 
 from prompt_toolkit import Application
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import FormattedTextControl, HSplit, Layout, VSplit, Window
-from prompt_toolkit.shortcuts import yes_no_dialog
+from prompt_toolkit.layout import FormattedTextControl, HSplit, Layout, Window
 from prompt_toolkit.styles import Style
 
-# --------------------------------------------------------------------------
-# Configuration – point at the same DB the bot uses
-# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# Configuration – path to the chat‑history database
+# --------------------------------------------------------------------------- #
 DB_PATH = os.getenv("CHAT_HISTORY_DB", os.path.expanduser("chat_history.db"))
 if not os.path.exists(DB_PATH):
     raise FileNotFoundError(f"No database at {DB_PATH} – is the bot running?")
 
-# Capture the original sqlite3.connect before any monkey‑patching
+# Keep a reference to the original sqlite3.connect() before any monkey‑patching
 _ORIG_SQLITE_CONNECT = sqlite3.connect
 
 
-# --------------------------------------------------------------------------
-# Helper: run a query, return column names and rows
-# --------------------------------------------------------------------------
-def fetch(
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def _query(
     order_by: str | None = None, descending: bool = True
 ) -> tuple[list[str], list[tuple]]:
-    """Return column names and rows, optionally sorted by *order_by*."""
-    order_col = order_by if order_by else "timestamp"
-    order_sql = f" ORDER BY {order_col} {'DESC' if descending else 'ASC'}"
+    """
+    Execute ``SELECT * FROM messages`` on the database, optionally sorted.
+
+    Parameters
+    ----------
+    order_by:
+        The column name to sort by.  If ``None`` the column ``timestamp`` is used.
+    descending:
+        Whether the order should be descending (``True``) or ascending
+        (``False``).
+
+    Returns
+    -------
+    tuple
+        ``(column_names, rows)`` where *column_names* is a list of strings
+        and *rows* is a list of tuples, each tuple containing a database row.
+    """
+    column = order_by or "timestamp"
+    order_clause = f" ORDER BY {column} {'DESC' if descending else 'ASC'}"
 
     with _ORIG_SQLITE_CONNECT(DB_PATH) as conn:
         cur = conn.cursor()
-        cur.execute(f"SELECT * FROM messages{order_sql} LIMIT 100")
+        cur.execute(f"SELECT * FROM messages{order_clause} LIMIT 100")
         cols = [d[0] for d in cur.description]
         rows = cur.fetchall()
-        return cols, rows
+    return cols, rows
 
 
-# --------------------------------------------------------------------------
-# Periodic refresh: re‑fetch the DB every second
-# --------------------------------------------------------------------------
 async def _periodic_refresh(ui: "TableUI") -> None:
+    """
+    Periodically reload the database every second to keep the UI up‑to‑date.
+    """
     while True:
         await asyncio.sleep(1)
-        # Preserve the current sorting order
-        cols, rows = fetch(order_by=ui.sort_col, descending=ui.sort_descending)
+        cols, rows = _query(order_by=ui.sort_col, descending=ui.sort_descending)
         if rows != ui.rows or cols != ui.cols:
             ui.cols, ui.rows = cols, rows
             ui.app.invalidate()
 
 
-# --------------------------------------------------------------------------
-# The UI – a very small table viewer
-# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# UI
+# --------------------------------------------------------------------------- #
 class TableUI:
-    # indices of the four columns we want to display
+    """
+    Main application class – a thin wrapper around a prompt_toolkit ``Application``.
+    """
+
+    # The columns that are shown in the table; everything else is displayed
+    # only in the overlay.
     _VISIBLE_COLS = ("user_name", "is_dm", "role", "timestamp")
 
     def __init__(self) -> None:
-        # Current sorting state
-        self.sort_col: str | None = None
-        # Track the last sorted column and whether we sorted ascending
-        self.last_sort_col: str | None = None
-        self.sort_descending: bool = True
+        # ------------------------------------------------------------------ #
+        # State – sorting
+        # ------------------------------------------------------------------ #
+        self.sort_col: str | None = None  # column currently sorted on
+        self.last_sort_col: str | None = None  # last sorted column
+        self.sort_descending: bool = True  # sort direction
 
-        # Initial data load using the default sorting
-        self.cols, self.rows = fetch(
+        # ------------------------------------------------------------------ #
+        # Initial data load
+        # ------------------------------------------------------------------ #
+        self.cols, self.rows = _query(
             order_by=self.sort_col, descending=self.sort_descending
         )
+
+        # ------------------------------------------------------------------ #
+        # Selection state
+        # ------------------------------------------------------------------ #
         self.selected_row = 0
         self.selected_col = 0
 
-        # Overlay state – None or the content string of the selected row
-        self.overlay_text: str | None = None
-        # offset into the displayed message when overlaying
-        self.overlay_offset: int = 0
+        # ------------------------------------------------------------------ #
+        # Overlay state – ``None`` means no overlay
+        # ------------------------------------------------------------------ #
+        self.overlay_content: str | None = None
+        self.overlay_offset: int = 0  # line offset for scrolling
 
-        # compute how many lines fit in the body window
+        # ------------------------------------------------------------------ #
+        # Layout helpers
+        # ------------------------------------------------------------------ #
         self._refresh_dimensions()
 
-        # Prompt‑toolkit widgets
         self.header_control = FormattedTextControl(text=self._render_header)
         self.body_control = FormattedTextControl(text=self._render_body)
 
         self.header_win = Window(
-            content=self.header_control,
-            height=1,
-            style="reverse bold",
+            content=self.header_control, height=1, style="reverse bold"
         )
-        self.body_win = Window(
-            content=self.body_control,
-            always_hide_cursor=True,
-        )
+        self.body_win = Window(content=self.body_control, always_hide_cursor=True)
 
+        # ------------------------------------------------------------------ #
         # Key bindings
+        # ------------------------------------------------------------------ #
         self.kb = KeyBindings()
         self._bind_keys()
 
-        # The whole layout
+        # ------------------------------------------------------------------ #
+        # The prompt_toolkit application
+        # ------------------------------------------------------------------ #
         self.app = Application(
             layout=Layout(HSplit([self.header_win, self.body_win])),
             key_bindings=self.kb,
@@ -124,191 +157,134 @@ class TableUI:
             mouse_support=False,
         )
 
-    # ----------------------------------------------------------------------
-    # Helper – refresh terminal dimensions
-    # ----------------------------------------------------------------------
+    # ----------------------------------------------------------------------- #
+    # Terminal size helpers
+    # ----------------------------------------------------------------------- #
     def _refresh_dimensions(self) -> None:
-        """Refresh `body_height` and `body_width` from the current terminal."""
+        """Cache the current terminal height and width."""
         try:
             size = os.get_terminal_size()
-            self.body_height = size.lines - 1  # 1 for header
+            self.body_height = size.lines - 1  # one line is used by the header
             self.body_width = size.columns
         except OSError:
-            # Fallback for non‑interactive environments
-            self.body_height = 24 - 1
+            # Non‑interactive fallback (e.g. when running tests)
+            self.body_height = 23
             self.body_width = 80
 
-    # ----------------------------------------------------------------------
-    # Callback for terminal resize
-    # ----------------------------------------------------------------------
-    def _on_resize(self, app: Application) -> None:
-        """Called by prompt_toolkit when the window is resized."""
-        self._refresh_dimensions()
-        app.invalidate()
+    # ----------------------------------------------------------------------- #
+    # Rendering
+    # ----------------------------------------------------------------------- #
+    def _render_header(self) -> Iterable[tuple[str, str]]:
+        """Return a sequence of ``(style, text)`` tuples for the header row."""
+        parts: list[tuple[str, str]] = []
 
-    # ----------------------------------------------------------------------
-    # Rendering helpers
-    # ----------------------------------------------------------------------
-    def _render_header(self):
-        """Return a list of (style, text) tuples for the header row."""
-        parts = []
-        # Determine the indices of the visible columns
-        visible_idx = [self.cols.index(c) for c in self._VISIBLE_COLS]
-        for col_idx, col in enumerate(self._VISIBLE_COLS):
-            """
-            ``col_idx`` is the position of the column **among the visible
-            columns** (0‑based).  The tests use this index to decide which
-            header cell should be highlighted.
-            """
-            style = (
-                ""
-                if col_idx == 0
-                else ("reverse bold" if col_idx == self.selected_col else "")
-            )
+        # ``self._VISIBLE_COLS`` already gives the order we want to display.
+        for idx, col in enumerate(self._VISIBLE_COLS):
+            # Highlight the column header that is currently selected.
+            style = "" if idx == self.selected_col else "reverse bold"
             parts.append((style, f" {col} "))
+
         return parts
 
-    def _render_body(self):
-        """
-        Return a flat list of (style, text) tuples for the body.
-        Handles overlay mode and dynamic wrapping / resizing.
-        """
-        # Ensure dimensions are up‑to‑date
+    def _render_body(self) -> Iterable[tuple[str, str]]:
+        """Return a sequence of ``(style, text)`` tuples for the body."""
         self._refresh_dimensions()
 
-        # If we are overlaying, just show the content.
-        if self.overlay_text is not None:
-            # Split on existing newlines, then wrap each line to the terminal width
-            raw_lines = self.overlay_text.splitlines()
-            wrapped_lines: list[str] = []
-            for raw in raw_lines:
-                wrapped_lines.extend(textwrap.wrap(raw, width=self.body_width))
-            # Apply scrolling offset
+        # ------------------------------------------------------------------ #
+        # Overlay mode – show the full message content
+        # ------------------------------------------------------------------ #
+        if self.overlay_content is not None:
+            raw_lines = self.overlay_content.splitlines()
+            wrapped = [
+                line
+                for raw in raw_lines
+                for line in textwrap.wrap(raw, width=self.body_width)
+            ]
+
             start = self.overlay_offset
-            end = min(start + self.body_height, len(wrapped_lines))
-            result: list[tuple[str, str]] = []
-            for line in wrapped_lines[start:end]:
-                result.append(("", line + "\n"))
-            return result
+            end = min(start + self.body_height, len(wrapped))
+            return [("", line + "\n") for line in wrapped[start:end]]
 
-        result: list[tuple[str, str]] = []
+        # ------------------------------------------------------------------ #
+        # Table mode – show the visible columns for each row
+        # ------------------------------------------------------------------ #
         visible_idx = [self.cols.index(c) for c in self._VISIBLE_COLS]
+        result: list[tuple[str, str]] = []
 
-        for row_idx, row in enumerate(self.rows):
-            for col_idx, idx in enumerate(visible_idx):
-                val = row[idx]
+        for r_idx, row in enumerate(self.rows):
+            for c_idx, col_idx in enumerate(visible_idx):
+                val = row[col_idx]
                 style = (
                     "reverse"
-                    if row_idx == self.selected_row and col_idx == self.selected_col
+                    if r_idx == self.selected_row and c_idx == self.selected_col
                     else ""
                 )
-                # Truncate long values for display
+                # Truncate long values to keep the table tidy
                 display = f" {str(val)[:30]:30} "
                 result.append((style, display))
-
             result.append(("", "\n"))
+
         return result
 
-    # ----------------------------------------------------------------------
+    # ----------------------------------------------------------------------- #
     # Key bindings
-    # ----------------------------------------------------------------------
-    def _bind_keys(self):
-        # Left/right navigation – ignore when overlaying
+    # ----------------------------------------------------------------------- #
+    def _bind_keys(self) -> None:
         @self.kb.add("left")
-        def _left(event):
-            """
-            Move the column selector left, *unless* we are currently
-            overlaying a message.  When overlaying the left/right keys
-            should be inert to avoid moving the table selection.
-            """
-            if self.overlay_text is None:
+        def _move_left(event) -> None:
+            if self.overlay_content is None:
                 self.selected_col = max(0, self.selected_col - 1)
                 event.app.invalidate()
 
         @self.kb.add("right")
-        def _right(event):
-            """
-            Move the column selector right, *unless* we are currently
-            overlaying a message.  When overlaying the right/left keys
-            should be inert to avoid moving the table selection.
-            """
-            if self.overlay_text is None:
+        def _move_right(event) -> None:
+            if self.overlay_content is None:
                 self.selected_col = min(
                     len(self._VISIBLE_COLS) - 1, self.selected_col + 1
                 )
                 event.app.invalidate()
 
         @self.kb.add("up")
-        def _up(event):
-            if self.overlay_text is not None:
-                # Ensure dimensions are current
-                self._refresh_dimensions()
-                raw_lines = self.overlay_text.splitlines()
-                wrapped_lines = []
-                for raw in raw_lines:
-                    wrapped_lines.extend(textwrap.wrap(raw, width=self.body_width))
-                max_offset = max(0, len(wrapped_lines) - self.body_height)
-                self.overlay_offset = max(0, self.overlay_offset - 1)
-                event.app.invalidate()
-            else:
+        def _move_up(event) -> None:
+            if self.overlay_content is None:
                 self.selected_row = max(0, self.selected_row - 1)
-
-        @self.kb.add("down")
-        def _down(event):
-            if self.overlay_text is not None:
-                # Ensure dimensions are current
-                self._refresh_dimensions()
-                raw_lines = self.overlay_text.splitlines()
-                wrapped_lines = []
-                for raw in raw_lines:
-                    wrapped_lines.extend(textwrap.wrap(raw, width=self.body_width))
-                max_offset = max(0, len(wrapped_lines) - self.body_height)
-                self.overlay_offset = min(max_offset, self.overlay_offset + 1)
-                event.app.invalidate()
             else:
-                self.selected_row = min(len(self.rows) - 1, self.selected_row + 1)
-
-        # Bind space key – the actual key name for the space bar is a single
-        # space character (``" "``).  We bind both "space" (used by the tests)
-        # and the literal space character.  The handler is stored on the UI
-        # instance so the test suite can retrieve it via a custom
-        # ``get_bindings_for_keys`` override (see below).
-        @self.kb.add("space")
-        def _space(event):
-            """
-            Toggle overlay of the message content of the currently
-            selected row. The content column is at index 6 in the DB.
-            """
-            if self.overlay_text is None:
-                content = self.rows[self.selected_row][6]
-                self.overlay_text = str(content)
-                self.overlay_offset = 0
-            else:
-                self.overlay_text = None
+                self.overlay_offset = max(0, self.overlay_offset - 1)
             event.app.invalidate()
 
-        self._space_handler = _space
+        @self.kb.add("down")
+        def _move_down(event) -> None:
+            if self.overlay_content is None:
+                self.selected_row = min(len(self.rows) - 1, self.selected_row + 1)
+            else:
+                # Compute the maximum offset for scrolling
+                raw_lines = self.overlay_content.splitlines()
+                wrapped = [
+                    line
+                    for raw in raw_lines
+                    for line in textwrap.wrap(raw, width=self.body_width)
+                ]
+                max_offset = max(0, len(wrapped) - self.body_height)
+                self.overlay_offset = min(max_offset, self.overlay_offset + 1)
+            event.app.invalidate()
 
-        # Alias for the literal space character – useful when the UI
-        # receives a real space keypress.
+        @self.kb.add("space")
         @self.kb.add(" ")
-        def _space_alias(event):
-            _space(event)
+        def _toggle_overlay(event) -> None:
+            if self.overlay_content is None:
+                # Column index 6 holds the message content in the database schema
+                self.overlay_content = str(self.rows[self.selected_row][6])
+                self.overlay_offset = 0
+            else:
+                self.overlay_content = None
+            event.app.invalidate()
 
         @self.kb.add("x")
-        def _x(event):
-            """
-            Delete the currently selected row after confirmation.
-            """
-            if self.overlay_text is not None:
+        def _delete_row(event) -> None:
+            if self.overlay_content is not None:
                 return
 
-            msg_id = self.rows[self.selected_row][0]
-            # The test suite sometimes replaces ``self.rows`` with a
-            # tuple that contains a fake primary key.  To ensure that
-            # the correct database row is deleted we look up the
-            # row by its full contents instead of assuming that the
-            # first column is the database primary key.
+            # Identify the row to delete by its primary key.
             row = self.rows[self.selected_row]
             with _ORIG_SQLITE_CONNECT(DB_PATH) as conn:
                 cur = conn.cursor()
@@ -320,27 +296,19 @@ class TableUI:
                     """,
                     (row[1], row[2], row[3], row[4], row[5], row[6], row[7]),
                 )
-                res = cur.fetchone()
-                if res:
-                    msg_id = res[0]
-                    conn.execute("DELETE FROM messages WHERE id=?", (msg_id,))
+                result = cur.fetchone()
+                if result:
+                    conn.execute("DELETE FROM messages WHERE id=?", (result[0],))
                     conn.commit()
 
+            # Remove the row from the in‑memory list
             del self.rows[self.selected_row]
             if self.selected_row >= len(self.rows):
                 self.selected_row = max(0, len(self.rows) - 1)
             event.app.invalidate()
 
         @self.kb.add("t")
-        def _t(event):
-            """
-            Sort the table by the currently selected column.
-
-            Pressing **t** the first time sorts the column in
-            descending order.  Subsequent presses on the *same* column
-            toggle the direction, while pressing **t** on a
-            *different* column always defaults to descending.
-            """
+        def _sort_column(event) -> None:
             col_name = self._VISIBLE_COLS[self.selected_col]
             self.sort_col = col_name
 
@@ -350,44 +318,41 @@ class TableUI:
                 self.sort_descending = True
             self.last_sort_col = col_name
 
-            self.cols, self.rows = fetch(
+            self.cols, self.rows = _query(
                 order_by=col_name, descending=self.sort_descending
             )
             self.selected_row = 0
-            self.app.invalidate()
+            event.app.invalidate()
 
         @self.kb.add("q")
         @self.kb.add("c-c")
-        def _quit(event):
+        def _quit(event) -> None:
             event.app.exit()
 
-    # ----------------------------------------------------------------------
-    # Entry point
-    # ----------------------------------------------------------------------
-    def run(self):
-        """
-        Run the UI.
-        """
+    # ----------------------------------------------------------------------- #
+    # Public API
+    # ----------------------------------------------------------------------- #
+    def run(self) -> None:
+        """Start the UI."""
 
-        async def _start():
+        async def _start() -> None:
             self.app.create_background_task(_periodic_refresh(self))
             await self.app.run_async()
 
         asyncio.run(_start())
 
 
-# --------------------------------------------------------------------------
-# Main – drop into the console
-# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# Entrypoint – run the UI when the module is executed directly
+# --------------------------------------------------------------------------- #
 if __name__ == "__main__":
-    os.environ["CHAT_HISTORY_DB"] = DB_PATH
     ui = TableUI()
     ui.run()
 
 
-# --------------------------------------------------------------------------
-# Make the module available as a global name for tests
-# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# Expose the module under a global name so that tests can import it easily
+# --------------------------------------------------------------------------- #
 import builtins
 import sys
 

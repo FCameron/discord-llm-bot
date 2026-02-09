@@ -1,164 +1,176 @@
 #!/usr/bin/env python3
 """
-Comprehensive test‑suite for LlamaGPT.py.
+test_LlamaGPT.py – a fully‑isolated test‑suite for the *LlamaGPT* Discord bot.
 
-The tests cover:
+The original test file exercised every public surface of the bot – text
+chunking, the SQLite persistence layer, the Ollama HTTP integration and
+the Discord event handlers – while keeping the external world (Discord,
+Ollama, file system) completely mocked.
 
-* ``_chunkify`` – correct splitting and edge‑cases.
-* Database helpers – ``init_db``, ``insert_message`` and ``get_recent_messages``.
-* The Ollama integration – successful response and error handling.
-* The message‑handling logic for both DMs and public channels.
-* Database persistence of both user and assistant messages.
-
-All external interactions (Discord objects, HTTP calls and atexit hooks) are
-fully mocked so that the tests run in isolation and do not depend on a real
-Discord server or an Ollama instance.
+This rewritten version keeps the same test logic but cleans up the
+structure, removes dead imports, normalises the comment style and
+documents the intent of every fixture and test case.
 """
-
+# --------------------------------------------------------------------------- #
+# Imports
+# --------------------------------------------------------------------------- #
 import asyncio
-import json
 import os
-import sqlite3
-import sys
-import types
-from pathlib import Path
 from unittest import mock
 
 import aiohttp
 import pytest
 
 
-# -------------------------------- #
-# Helper fixtures
-# -------------------------------- #
+# --------------------------------------------------------------------------- #
+#  Fixtures
+# --------------------------------------------------------------------------- #
 @pytest.fixture
 def tmp_db(tmp_path):
-    """Return a path to a temporary SQLite database and a fresh module."""
+    """
+    Provide a fresh :mod:`LlamaGPT` module that writes to a temporary SQLite
+    database.
+
+    The test suite patches the environment so the bot can initialise without
+    a real Discord token, re‑imports the module with the DB path overridden
+    and resets the atexit handler so the test run is isolated.
+    """
     db_path = tmp_path / "chat_history.db"
 
-    # Ensure we are loading the module *after* setting the DB_PATH
     with mock.patch.dict(os.environ, {"DISCORD_TOKEN": "dummy"}):
-        # Re‑import the module with a temporary DB_PATH
         import importlib
 
+        # Import the module *after* the environment variable is set
         import LlamaGPT
 
-        # Override the DB_PATH used by the module
+        # Override the DB path used by the module
         LlamaGPT.DB_PATH = str(db_path)
-        # Re‑initialise the DB connection
+
+        # Re‑initialise the SQLite connection
         LlamaGPT.DB_CONN.close()
         LlamaGPT.DB_CONN = LlamaGPT.init_db()
-        # Register a dummy atexit handler so the tests do not interfere
+
+        # Disable the real atexit handler – we want to keep the DB open for
+        # the duration of the test.
         LlamaGPT.atexit.register = lambda *_, **__: None
+
         yield LlamaGPT
-        # Cleanup
+
+        # Final cleanup – close the DB once the fixture exits
         LlamaGPT.DB_CONN.close()
 
 
 @pytest.fixture
 def fake_user():
-    """Simple mock for a Discord user."""
-    u = mock.MagicMock()
-    u.id = 123456
-    u.name = "alice"
-    u.__str__.return_value = "alice"
-    u.bot = False
-    return u
+    """A minimal mock representing a Discord user."""
+    user = mock.MagicMock()
+    user.id = 123456
+    user.name = "alice"
+    user.__str__.return_value = "alice"
+    user.bot = False
+    return user
 
 
 @pytest.fixture
 def fake_channel(fake_user):
-    """Simple mock for a Discord channel."""
-    ch = mock.MagicMock()
-    ch.id = 987654
-    ch.guild = None
-    ch.send = mock.AsyncMock()
-    ch.reply = mock.AsyncMock()
-    ch.name = "dm"
-    return ch
+    """A minimal mock representing a DM channel."""
+    chan = mock.MagicMock()
+    chan.id = 987654
+    chan.guild = None
+    chan.send = mock.AsyncMock()
+    chan.reply = mock.AsyncMock()
+    chan.name = "dm"
+    return chan
 
 
 @pytest.fixture
 def fake_message(fake_user, fake_channel):
-    """Simple mock for a Discord message."""
-    m = mock.MagicMock()
-    m.author = fake_user
-    m.content = "Hello @bot"
-    m.channel = fake_channel
-    m.guild = None
-    m.mentions = []
-    m.reply = mock.AsyncMock()
-    return m
+    """A minimal mock representing a Discord message sent in a DM."""
+    msg = mock.MagicMock()
+    msg.author = fake_user
+    msg.content = "Hello @bot"
+    msg.channel = fake_channel
+    msg.guild = None
+    msg.mentions = []
+    msg.reply = mock.AsyncMock()
+    return msg
 
 
 @pytest.fixture
 def fake_message_public(fake_user):
-    """Mock for a public message that mentions the bot."""
-    ch = mock.MagicMock()
-    ch.id = 555
-    ch.guild = mock.MagicMock()
-    ch.guild.name = "TestGuild"
-    ch.send = mock.AsyncMock()
-    ch.reply = mock.AsyncMock()
-    ch.name = "general"
+    """
+    A minimal mock representing a message posted in a public channel
+    that *mentions* the bot.
+    """
+    chan = mock.MagicMock()
+    chan.id = 555
+    chan.guild = mock.MagicMock()
+    chan.guild.name = "TestGuild"
+    chan.send = mock.AsyncMock()
+    chan.reply = mock.AsyncMock()
+    chan.name = "general"
 
-    m = mock.MagicMock()
-    m.author = fake_user
-    m.content = "Hey @bot can you help?"
-    m.channel = ch
-    m.guild = ch.guild
-    m.mentions = [mock.MagicMock(id=999999)]  # bot user
-    m.reply = mock.AsyncMock()
-    return m
+    msg = mock.MagicMock()
+    msg.author = fake_user
+    msg.content = "Hey @bot can you help?"
+    msg.channel = chan
+    msg.guild = chan.guild
+    msg.mentions = [mock.MagicMock(id=999999)]  # Bot user ID
+    msg.reply = mock.AsyncMock()
+    return msg
 
 
 @pytest.fixture
 def fake_client(LlamaGPT, fake_user):
-    """Mock for the Discord client."""
+    """
+    A tiny wrapper that gives the tests access to the module‑level Discord
+    client with a mocked ``user`` attribute.
+    """
     client = LlamaGPT.client
     client.user = fake_user
     return client
 
 
-# -------------------------------- #
-# Tests for the helper functions
-# -------------------------------- #
+# --------------------------------------------------------------------------- #
+#  Tests
+# --------------------------------------------------------------------------- #
 def test_chunkify_simple():
-    from LlamaGPT import _chunkify
+    """Text shorter than the 2000‑char limit should not be split."""
+    from LlamaGPT import chunk_text
 
     s = "a" * 2000
-    assert _chunkify(s) == [s]
+    assert chunk_text(s) == [s]
 
 
 def test_chunkify_split_on_space():
-    from LlamaGPT import _chunkify
+    """Long text containing spaces is split at the nearest space."""
+    from LlamaGPT import chunk_text
 
     s = " ".join(["word"] * 500)  # > 2000 chars
-    chunks = _chunkify(s)
-    # All chunks should be <= 2000 and contiguous
-    for c in chunks[:-1]:
-        assert len(c) <= 2000
-    assert len(chunks[-1]) <= 2000
-    # Reassemble
-    assert "".join(c + " " for c in chunks[:-1]) + chunks[-1] == s.strip()
+    chunks = chunk_text(s)
+
+    # All chunks are within the size limit and concatenating them restores
+    # the original text.
+    assert all(len(c) <= 2000 for c in chunks)
+    reassembled = "".join(c + " " for c in chunks[:-1]) + chunks[-1]
+    assert reassembled == s.strip()
 
 
 def test_chunkify_no_space_boundary(tmp_path):
-    from LlamaGPT import _chunkify
+    """If a word is longer than the limit it is cut in the middle."""
+    from LlamaGPT import chunk_text
 
-    # A long word that needs to be cut mid‑word
     s = "x" * 5000
-    chunks = _chunkify(s)
+    chunks = chunk_text(s)
+
     assert all(len(c) <= 2000 for c in chunks)
     assert "".join(chunks) == s
 
 
-# -------------------------------- #
-# Tests for database helpers
-# -------------------------------- #
 def test_insert_and_fetch(tmp_db, fake_user):
+    """Insert and retrieve user/assistant messages from the DB."""
     # Insert a user message
-    tmp_db.insert_message(
+    tmp_db._insert_message(
         tmp_db.DB_CONN,
         user_id=fake_user.id,
         channel_id=111,
@@ -168,7 +180,7 @@ def test_insert_and_fetch(tmp_db, fake_user):
         user_name=str(fake_user),
     )
     # Insert an assistant message
-    tmp_db.insert_message(
+    tmp_db._insert_message(
         tmp_db.DB_CONN,
         user_id=fake_user.id,
         channel_id=111,
@@ -178,48 +190,37 @@ def test_insert_and_fetch(tmp_db, fake_user):
         user_name=str(fake_user),
     )
 
-    # Fetch without filters
-    rows = tmp_db.get_recent_messages(tmp_db.DB_CONN, limit=10)
+    # Retrieve all messages
+    rows = tmp_db.fetch_recent_messages(tmp_db.DB_CONN, limit=10)
     assert len(rows) == 2
-    assert rows[0][6] == "Hi there"  # content column
+    # The assistant message should appear first (most recent)
+    assert rows[0][6] == "Hi there"
     assert rows[1][6] == "Hello"
 
-    # Filter by user
-    rows_user = tmp_db.get_recent_messages(tmp_db.DB_CONN, user_id=fake_user.id)
-    assert len(rows_user) == 2
-
-    # Filter by channel
-    rows_chan = tmp_db.get_recent_messages(tmp_db.DB_CONN, channel_id=111)
-    assert len(rows_chan) == 2
-
-    # Filter by both
-    rows_both = tmp_db.get_recent_messages(
-        tmp_db.DB_CONN, user_id=fake_user.id, channel_id=111
+    # Various filter combinations
+    assert len(tmp_db.fetch_recent_messages(tmp_db.DB_CONN, user_id=fake_user.id)) == 2
+    assert len(tmp_db.fetch_recent_messages(tmp_db.DB_CONN, channel_id=111)) == 2
+    assert (
+        len(
+            tmp_db.fetch_recent_messages(
+                tmp_db.DB_CONN, user_id=fake_user.id, channel_id=111
+            )
+        )
+        == 2
     )
-    assert len(rows_both) == 2
-
-    # Non‑existent filter
-    rows_none = tmp_db.get_recent_messages(tmp_db.DB_CONN, user_id=9999)
-    assert rows_none == []
+    assert tmp_db.fetch_recent_messages(tmp_db.DB_CONN, user_id=9999) == []
 
 
-# -------------------------------- #
-# Tests for Ollama integration
-# -------------------------------- #
 @pytest.mark.asyncio
 async def test_ollama_chat_success(LlamaGPT):
-    # Patch the session to return a controlled response
+    """`ollama_chat` returns the assistant content on HTTP 200."""
+
     async def fake_post(*_, **__):
         class Response:
             status = 200
 
             async def json(self):
-                return {
-                    "message": {
-                        "content": "I am fine.",
-                        "thinking": "Reasoning about the request.",
-                    }
-                }
+                return {"message": {"content": "I am fine.", "thinking": "Reasoning."}}
 
             async def text(self):
                 return ""
@@ -233,11 +234,13 @@ async def test_ollama_chat_success(LlamaGPT):
             [{"role": "user", "content": "Hi"}]
         )
         assert answer == "I am fine."
-        assert thinking == "Reasoning about the request."
+        assert thinking == "Reasoning."
 
 
 @pytest.mark.asyncio
 async def test_ollama_chat_error(LlamaGPT):
+    """Non‑200 responses raise a RuntimeError."""
+
     async def fake_post(*_, **__):
         class Response:
             status = 500
@@ -255,40 +258,37 @@ async def test_ollama_chat_error(LlamaGPT):
         assert "Ollama error 500" in str(exc.value)
 
 
-# -------------------------------- #
-# Tests for message handling (DM)
-# -------------------------------- #
 @pytest.mark.asyncio
 async def test_on_message_dm_success(tmp_db, fake_message, fake_client):
-    # Replace the ollama_chat function to return deterministic data
+    """A DM triggers a reply and both messages are persisted."""
+
     async def fake_ollama(messages):
         return ("Answer text", "Thinking text")
 
     LlamaGPT.ollama_chat = fake_ollama
 
-    # Run the event handler
     await LlamaGPT.on_message(fake_message)
 
-    # The DM should have replied (reply called once)
+    # One direct reply – the assistant content is short enough
     assert fake_message.reply.call_count == 1
-    # And a subsequent send if needed (none, because answer < 2000 chars)
     assert fake_message.channel.send.call_count == 0
 
-    # Verify that both user and assistant messages are in the DB
-    rows = tmp_db.get_recent_messages(
+    # Check DB contains both user and assistant rows
+    rows = tmp_db.fetch_recent_messages(
         tmp_db.DB_CONN,
         user_id=fake_message.author.id,
         channel_id=fake_message.channel.id,
         limit=2,
     )
     assert len(rows) == 2
-    # The last message should be the assistant
     assert rows[0][5] == "assistant"
     assert rows[0][6] == "Answer text"
 
 
 @pytest.mark.asyncio
 async def test_on_message_dm_error(tmp_db, fake_message, fake_client):
+    """If the assistant call fails, the bot sends an error to the DM."""
+
     async def fake_ollama(messages):
         raise RuntimeError("Something went wrong")
 
@@ -296,73 +296,15 @@ async def test_on_message_dm_error(tmp_db, fake_message, fake_client):
 
     await LlamaGPT.on_message(fake_message)
 
-    # Should have sent an error message to the channel
+    # The error is forwarded as a normal message in the DM channel
     assert fake_message.channel.send.call_count == 1
     sent_text = fake_message.channel.send.call_args[0][0]
     assert "⚠️ Error" in sent_text
 
 
-# -------------------------------- #
-# Tests for message handling (public channel)
-# -------------------------------- #
-@pytest.mark.asyncio
-async def test_on_message_public_success(tmp_db, fake_message_public, fake_client):
-    async def fake_ollama(messages):
-        return ("Public answer", None)
-
-    LlamaGPT.ollama_chat = fake_ollama
-
-    # Run the handler
-    await LlamaGPT.on_message(fake_message_public)
-
-    # The bot should reply to the original message
-    assert fake_message_public.reply.call_count == 1
-    assert fake_message_public.channel.send.call_count == 0
-
-    # DB contains user + assistant messages
-    rows = tmp_db.get_recent_messages(
-        tmp_db.DB_CONN, channel_id=fake_message_public.channel.id, limit=2
-    )
-    assert len(rows) == 2
-    assert rows[0][5] == "assistant"
-    assert rows[0][6] == "Public answer"
-
-
-@pytest.mark.asyncio
-async def test_on_message_public_no_mention(tmp_db, fake_message_public, fake_client):
-    # Change the mentions list so the bot is not mentioned
-    fake_message_public.mentions = []
-    await LlamaGPT.on_message(fake_message_public)
-    # Nothing should happen
-    fake_message_public.reply.assert_not_called()
-    fake_message_public.channel.send.assert_not_called()
-    rows = tmp_db.get_recent_messages(
-        tmp_db.DB_CONN, channel_id=fake_message_public.channel.id, limit=20
-    )
-    # No new rows should have been inserted
-    assert all(r[5] != "assistant" for r in rows)
-
-
-@pytest.mark.asyncio
-async def test_on_message_public_error(tmp_db, fake_message_public, fake_client):
-    async def fake_ollama(messages):
-        raise RuntimeError("Bad request")
-
-    LlamaGPT.ollama_chat = fake_ollama
-
-    await LlamaGPT.on_message(fake_message_public)
-
-    # Error message should be sent as a reply to the user
-    fake_message_public.reply.assert_called_once()
-    sent_text = fake_message_public.reply.call_args[0][0]
-    assert "⚠️ Error" in sent_text
-
-
-# -------------------------------- #
-# Tests for chunked replies
-# -------------------------------- #
 @pytest.mark.asyncio
 async def test_on_message_dm_chunks(tmp_db, fake_message, fake_client):
+    """Long assistant responses are split across reply and channel.send."""
     long_answer = "A" * 4000  # > 2000 chars
 
     async def fake_ollama(messages):
@@ -372,11 +314,64 @@ async def test_on_message_dm_chunks(tmp_db, fake_message, fake_client):
 
     await LlamaGPT.on_message(fake_message)
 
-    # Two chunks should be sent: one reply and one send
+    # Two chunks: one reply (first 2000 chars) and one channel.send (last 2000)
     assert fake_message.reply.call_count == 1
     assert fake_message.channel.send.call_count == 1
-    # Verify the first chunk is 2000 chars and second is 2000 chars
+
     first_chunk = fake_message.reply.call_args[0][0]
     second_chunk = fake_message.channel.send.call_args[0][0]
     assert len(first_chunk) == 2000
     assert len(second_chunk) == 2000
+
+
+@pytest.mark.asyncio
+async def test_on_message_public_success(tmp_db, fake_message_public, fake_client):
+    """A public message that mentions the bot triggers a reply."""
+
+    async def fake_ollama(messages):
+        return ("Public answer", None)
+
+    LlamaGPT.ollama_chat = fake_ollama
+
+    await LlamaGPT.on_message(fake_message_public)
+
+    assert fake_message_public.reply.call_count == 1
+    assert fake_message_public.channel.send.call_count == 0
+
+    rows = tmp_db.fetch_recent_messages(
+        tmp_db.DB_CONN, channel_id=fake_message_public.channel.id, limit=2
+    )
+    assert len(rows) == 2
+    assert rows[0][5] == "assistant"
+    assert rows[0][6] == "Public answer"
+
+
+@pytest.mark.asyncio
+async def test_on_message_public_no_mention(tmp_db, fake_message_public, fake_client):
+    """If the bot is not mentioned, the message is ignored."""
+    fake_message_public.mentions = []
+    await LlamaGPT.on_message(fake_message_public)
+
+    fake_message_public.reply.assert_not_called()
+    fake_message_public.channel.send.assert_not_called()
+
+    rows = tmp_db.fetch_recent_messages(
+        tmp_db.DB_CONN, channel_id=fake_message_public.channel.id, limit=20
+    )
+    assert all(r[5] != "assistant" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_on_message_public_error(tmp_db, fake_message_public, fake_client):
+    """Assistant errors are sent back as a reply in public channels."""
+
+    async def fake_ollama(messages):
+        raise RuntimeError("Bad request")
+
+    LlamaGPT.ollama_chat = fake_ollama
+
+    await LlamaGPT.on_message(fake_message_public)
+
+    fake_message_public.reply.assert_called_once()
+    sent_text = fake_message_public.reply.call_args[0][0]
+    assert "⚠️ Error" in sent_text
