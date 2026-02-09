@@ -65,6 +65,7 @@ The bot relies on the following Python packages:
 
 - `discord.py` – The official Discord library
 - `aiohttp` – Async HTTP client used by the bot to talk to Ollama
+- `prompt-toolkit` – Terminal UI for the chat‑history viewer (`ChatHistoryUI.py`)
 - `pytest` – For the test suite
 - `pytest-asyncio` – Async test support
 - `pytest-mock` – Easier mocking in tests
@@ -73,7 +74,7 @@ Install them with:
 
 ```bash
 pip install -U pip
-pip install -U discord.py aiohttp pytest pytest-asyncio pytest-mock
+pip install -U discord.py aiohttp prompt-toolkit pytest pytest-asyncio pytest-mock
 ```
 
 ---
