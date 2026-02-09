@@ -7,10 +7,9 @@ Key changes (for this version):
 - Only the four columns `user_name`, `is_dm`, `role`, `timestamp` are shown.
 - Pressing **Space** overlays the *content* of the currently selected row
   on the whole screen – pressing any key while overlaying closes it.
-- The **Enter** key now exits the program (your “return” request).
-- Pressing **x** deletes the selected row after a Y/N confirmation.
-- When overlaying a long message, the arrow keys scroll the text instead
-  of moving the table selection.
+- The **t** key sorts the rows by the current columns, press again to resort.
+- Pressing **x** deletes the selected row. When overlaying a long message,
+- the arrow keys scroll the text instead of moving the table selection.
 """
 
 from __future__ import annotations
