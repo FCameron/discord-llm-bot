@@ -68,6 +68,9 @@ def fake_user():
     user.name = "alice"
     user.__str__.return_value = "alice"
     user.bot = False
+    # Provide a string for the mention attribute – required by the bot
+    # logic that strips the mention from the user text.
+    user.mention = ""  # or "<@999999>" if you want a realistic mention
     return user
 
 

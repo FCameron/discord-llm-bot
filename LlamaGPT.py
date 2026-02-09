@@ -301,9 +301,13 @@ async def on_message(message: Message) -> None:
 
         # Remove the bot’s mention from the user text so the model sees the
         # actual prompt content only.
+        # ``client.user`` might be ``None`` (e.g. before the bot has logged in
+        # or in a unit‑test that monkey‑patches it).  Build the mention string
+        # only when the user is present.
+        mention = client.user.mention if client.user else ""
         for m in history:
-            if isinstance(m["content"], str):
-                m["content"] = m["content"].replace(f"<@{client.user.id}>", "").strip()
+            if isinstance(m["content"], str) and mention:
+                m["content"] = m["content"].replace(mention, "").strip()
 
         try:
             answer, thinking = await ollama_chat(history)
