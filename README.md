@@ -3,6 +3,8 @@
 A lightweight Discord bot that forwards user mentions to a **locally hosted LLM via Ollama**.  
 The bot also logs every exchange to an SQLite database and prints the model’s internal “thinking” text for debugging.
 
+![example bot chat](assets/Example.png)
+
 > **Why Ollama?**  
 > Ollama gives you instant, zero‑cost inference on your own machine, with a convenient HTTP API and a catalog of open‑source models.
 
